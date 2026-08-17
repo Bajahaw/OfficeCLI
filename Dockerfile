@@ -1,10 +1,9 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
-WORKDIR /src
+WORKDIR /repo
 COPY src/officecli/officecli.csproj src/officecli/
-COPY schemas/ schemas/
-COPY skills/ skills/
 RUN dotnet restore src/officecli/officecli.csproj -r linux-x64
-COPY src/ src/
+COPY . .
+RUN test -f skills/officecli/SKILL.md
 RUN dotnet publish src/officecli/officecli.csproj -c Release -r linux-x64 -o /out --no-restore --nologo
 
 FROM mcr.microsoft.com/dotnet/runtime-deps:10.0
