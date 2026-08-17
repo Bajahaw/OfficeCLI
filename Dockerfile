@@ -5,6 +5,7 @@ RUN dotnet restore src/officecli/officecli.csproj -r linux-x64
 COPY src/ src/
 COPY skills/ skills/
 COPY schemas/ schemas/
+COPY SKILL.md SKILL.md
 RUN test -f skills/officecli/SKILL.md
 RUN dotnet publish src/officecli/officecli.csproj -c Release -r linux-x64 -o /out --no-restore --nologo
 
