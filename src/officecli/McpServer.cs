@@ -12,44 +12,17 @@ using OfficeCli.Handlers;
 namespace OfficeCli;
 
 /// <summary>
-/// Minimal MCP (Model Context Protocol) server over stdio.
+/// Minimal MCP (Model Context Protocol) server over stdio or Streamable HTTP.
 /// Implements JSON-RPC 2.0 with initialize, tools/list, and tools/call.
 /// All JSON is hand-written via Utf8JsonWriter to avoid reflection (PublishTrimmed).
 /// </summary>
-public static class McpServer
+public static partial class McpServer
 {
     public static async Task RunAsync()
     {
+        ConfigureMcpProcess();
         using var reader = new StreamReader(Console.OpenStandardInput());
         using var writer = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
-
-        // Default this stdio process to NOT auto-spawn a resident. This opts
-        // out of spawning only — it does NOT bypass an existing one: TryResident
-        // still routes through a resident another officecli already holds for the
-        // file (probe-then-TrySend in CommandBuilder.TryResident), so two writers
-        // never fight over the file and no update is lost. The effect of the
-        // opt-out:
-        //   - no resident holds the file -> the command opens, applies, and
-        //     eager-saves directly, so the mutation is on disk by the time the
-        //     response returns;
-        //   - a resident already holds the file -> the command routes through it
-        //     and follows that resident's deferred flush (on disk at its
-        //     save/close/idle), same as any other client of that resident.
-        // Defaulting the opt-out on keeps a lone MCP session from leaving a
-        // spawned resident (and its deferred-flush surprise) behind it. An
-        // explicit user value (e.g. to opt INTO spawning residents) is respected.
-        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OFFICECLI_NO_AUTO_RESIDENT")))
-            Environment.SetEnvironmentVariable("OFFICECLI_NO_AUTO_RESIDENT", "1");
-
-        // The MCP process always has stdin redirected (it IS the JSON-RPC
-        // channel), so `batch --commands/--input` would emit the "stdin is also
-        // redirected; stdin will be ignored" warning on EVERY call — noise that
-        // also lands in the result text and breaks naive JSON parsing of the
-        // batch envelope. Under MCP that warning describes the transport, not a
-        // user mistake, so default its existing opt-out on (respect any explicit
-        // value).
-        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OFFICECLI_BATCH_ALLOW_STDIN_REDIRECT")))
-            Environment.SetEnvironmentVariable("OFFICECLI_BATCH_ALLOW_STDIN_REDIRECT", "1");
 
         // MCP server is a long-lived stdio process. The normal
         // per-invocation auto-upgrade path (Program.cs:112) is
@@ -77,69 +50,91 @@ public static class McpServer
                 var line = await reader.ReadLineAsync();
                 if (line == null) break;
                 if (string.IsNullOrWhiteSpace(line)) continue;
-
-                JsonElement? id = null;
-                try
-                {
-                    using var doc = JsonDocument.Parse(line);
-                    var root = doc.RootElement;
-                    // The JSON-RPC root must be an Object (single request). Arrays
-                    // are valid JSON-RPC 2.0 batch requests that we don't support;
-                    // numbers/strings/bools/nulls are malformed entirely. Guard
-                    // here before TryGetProperty, which throws on non-Object.
-                    if (root.ValueKind != JsonValueKind.Object)
-                    {
-                        var msg = root.ValueKind == JsonValueKind.Array
-                            ? "Invalid Request: batch requests are not supported"
-                            : "Invalid Request: request must be a JSON object";
-                        await writer.WriteLineAsync(ErrorJson(null, -32600, msg));
-                        continue;
-                    }
-                    // Parse id BEFORE method so a malformed method ('method': 42)
-                    // can still echo the original id back per JSON-RPC 2.0 §5.
-                    id = root.TryGetProperty("id", out var idEl) ? idEl.Clone() : null;
-                    // method must be a string per spec; non-string is an
-                    // Invalid Request (-32600), not an internal error.
-                    string? method = null;
-                    if (root.TryGetProperty("method", out var m))
-                    {
-                        if (m.ValueKind != JsonValueKind.String)
-                        {
-                            await writer.WriteLineAsync(ErrorJson(id, -32600, "Invalid Request: 'method' must be a string"));
-                            continue;
-                        }
-                        method = m.GetString();
-                    }
-
-                    var response = method switch
-                    {
-                        "initialize" => HandleInitialize(id),
-                        "notifications/initialized" => null,
-                        "tools/list" => HandleToolsList(id),
-                        "tools/call" => HandleToolsCall(id, root),
-                        "ping" => WriteJson(w => { w.WriteStartObject(); Rpc(w, id); w.WriteStartObject("result"); w.WriteEndObject(); w.WriteEndObject(); }),
-                        // CONSISTENCY(mcp-error): truncate caller-supplied value to prevent
-                        // response amplification (echo arbitrary-length input back unchanged).
-                        _ => id.HasValue ? ErrorJson(id, -32601, $"Method not found: {OfficeCli.Help.SchemaHelpLoader.TruncateForError(method ?? "", 64)}") : null,
-                    };
-
-                    if (response != null)
-                        await writer.WriteLineAsync(response);
-                }
-                catch (JsonException)
-                {
-                    await writer.WriteLineAsync(ErrorJson(null, -32700, "Parse error"));
-                }
-                catch (Exception ex)
-                {
-                    await writer.WriteLineAsync(ErrorJson(id, -32603, $"Internal error: {ex.Message}"));
-                }
+                var response = DispatchJsonRpc(line);
+                if (response != null)
+                    await writer.WriteLineAsync(response);
             }
         }
         finally
         {
             upgradeCts.Cancel();
             try { await upgradeTask; } catch { }
+        }
+    }
+
+    internal static void ConfigureMcpProcess()
+    {
+        // Default this MCP process to NOT auto-spawn a resident. This opts
+        // out of spawning only — it does NOT bypass an existing one: TryResident
+        // still routes through a resident another officecli already holds for the
+        // file (probe-then-TrySend in CommandBuilder.TryResident), so two writers
+        // never fight over the file and no update is lost. The effect of the
+        // opt-out:
+        //   - no resident holds the file -> the command opens, applies, and
+        //     eager-saves directly, so the mutation is on disk by the time the
+        //     response returns;
+        //   - a resident already holds the file -> the command routes through it
+        //     and follows that resident's deferred flush (on disk at its
+        //     save/close/idle), same as any other client of that resident.
+        // Defaulting the opt-out on keeps a lone MCP session from leaving a
+        // spawned resident (and its deferred-flush surprise) behind it. An
+        // explicit user value (e.g. to opt INTO spawning residents) is respected.
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OFFICECLI_NO_AUTO_RESIDENT")))
+            Environment.SetEnvironmentVariable("OFFICECLI_NO_AUTO_RESIDENT", "1");
+
+        // The MCP process always has stdin redirected (stdio) or is a long-lived
+        // HTTP server, so `batch --commands/--input` would emit the "stdin is also
+        // redirected; stdin will be ignored" warning on EVERY call — noise that
+        // also lands in the result text and breaks naive JSON parsing of the
+        // batch envelope. Under MCP that warning describes the transport, not a
+        // user mistake, so default its existing opt-out on (respect any explicit
+        // value).
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OFFICECLI_BATCH_ALLOW_STDIN_REDIRECT")))
+            Environment.SetEnvironmentVariable("OFFICECLI_BATCH_ALLOW_STDIN_REDIRECT", "1");
+    }
+
+    internal static string? DispatchJsonRpc(string body)
+    {
+        JsonElement? id = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                var msg = root.ValueKind == JsonValueKind.Array
+                    ? "Invalid Request: batch requests are not supported"
+                    : "Invalid Request: request must be a JSON object";
+                return ErrorJson(null, -32600, msg);
+            }
+            id = root.TryGetProperty("id", out var idEl) ? idEl.Clone() : null;
+            string? method = null;
+            if (root.TryGetProperty("method", out var m))
+            {
+                if (m.ValueKind != JsonValueKind.String)
+                    return ErrorJson(id, -32600, "Invalid Request: 'method' must be a string");
+                method = m.GetString();
+            }
+
+            return method switch
+            {
+                "initialize" => HandleInitialize(id, root),
+                "notifications/initialized" => null,
+                "tools/list" => HandleToolsList(id),
+                "tools/call" => HandleToolsCall(id, root),
+                "resources/list" => HandleResourcesList(id),
+                "resources/read" => HandleResourcesRead(id, root),
+                "ping" => WriteJson(w => { w.WriteStartObject(); Rpc(w, id); w.WriteStartObject("result"); w.WriteEndObject(); w.WriteEndObject(); }),
+                _ => id.HasValue ? ErrorJson(id, -32601, $"Method not found: {OfficeCli.Help.SchemaHelpLoader.TruncateForError(method ?? "", 64)}") : null,
+            };
+        }
+        catch (JsonException)
+        {
+            return ErrorJson(null, -32700, "Parse error");
+        }
+        catch (Exception ex)
+        {
+            return ErrorJson(id, -32603, $"Internal error: {ex.Message}");
         }
     }
 
@@ -174,17 +169,34 @@ public static class McpServer
 
     // ==================== Handlers ====================
 
-    private static string HandleInitialize(JsonElement? id) => WriteJson(w =>
+    private static readonly string[] SupportedProtocolVersions =
+        ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+    private static string HandleInitialize(JsonElement? id, JsonElement root) => WriteJson(w =>
     {
+        var protocol = "2025-11-25";
+        if (root.TryGetProperty("params", out var initParams)
+            && initParams.ValueKind == JsonValueKind.Object
+            && initParams.TryGetProperty("protocolVersion", out var pv))
+        {
+            var requested = pv.GetString();
+            if (requested != null && SupportedProtocolVersions.Contains(requested))
+                protocol = requested;
+        }
         w.WriteStartObject();
         Rpc(w, id);
         w.WriteStartObject("result");
-        w.WriteString("protocolVersion", "2024-11-05");
+        w.WriteString("protocolVersion", protocol);
         w.WriteStartObject("capabilities");
         w.WriteStartObject("tools"); w.WriteBoolean("listChanged", false); w.WriteEndObject();
+        w.WriteStartObject("resources"); w.WriteBoolean("listChanged", false); w.WriteBoolean("subscribe", false); w.WriteEndObject();
         w.WriteEndObject();
         var ver = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "0.0.0";
-        w.WriteStartObject("serverInfo"); w.WriteString("name", "officecli"); w.WriteString("version", ver); w.WriteEndObject();
+        w.WriteStartObject("serverInfo");
+        w.WriteString("name", "officecli");
+        w.WriteString("title", "OfficeCLI");
+        w.WriteString("version", ver);
+        w.WriteEndObject();
         w.WriteEndObject();
         w.WriteEndObject();
     });
@@ -200,6 +212,80 @@ public static class McpServer
         w.WriteEndObject();
         w.WriteEndObject();
     });
+
+    private static string HandleResourcesList(JsonElement? id) => WriteJson(w =>
+    {
+        w.WriteStartObject();
+        Rpc(w, id);
+        w.WriteStartObject("result");
+        w.WriteStartArray("resources");
+        var dir = SessionWorkDir.Value;
+        if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
+        {
+            foreach (var file in Directory.EnumerateFiles(dir))
+            {
+                if (!OfficeExts.Contains(Path.GetExtension(file))) continue;
+                w.WriteStartObject();
+                w.WriteString("uri", ToFileUri(file));
+                w.WriteString("name", Path.GetFileName(file));
+                w.WriteString("mimeType", MimeFromOfficeExt(Path.GetExtension(file)));
+                w.WriteEndObject();
+            }
+        }
+        w.WriteEndArray();
+        w.WriteEndObject();
+        w.WriteEndObject();
+    });
+
+    private static string HandleResourcesRead(JsonElement? id, JsonElement root)
+    {
+        if (!root.TryGetProperty("params", out var p) || !p.TryGetProperty("uri", out var uriEl))
+            return ErrorJson(id, -32602, "Missing params.uri");
+        var uri = uriEl.GetString();
+        if (string.IsNullOrEmpty(uri) || !TryResolveResourcePath(uri, out var path))
+            return ErrorJson(id, -32602, "Unknown or forbidden resource uri");
+        if (!File.Exists(path))
+            return ErrorJson(id, -32602, "Resource not found");
+        var info = new FileInfo(path);
+        if (info.Length > MaxAttachBytes)
+            return ErrorJson(id, -32603, "Resource exceeds size limit");
+        var blob = Convert.ToBase64String(File.ReadAllBytes(path));
+        var mime = MimeFromOfficeExt(Path.GetExtension(path));
+        return WriteJson(w =>
+        {
+            w.WriteStartObject();
+            Rpc(w, id);
+            w.WriteStartObject("result");
+            w.WriteStartArray("contents");
+            w.WriteStartObject();
+            w.WriteString("uri", uri);
+            w.WriteString("mimeType", mime);
+            w.WriteString("blob", blob);
+            w.WriteEndObject();
+            w.WriteEndArray();
+            w.WriteEndObject();
+            w.WriteEndObject();
+        });
+    }
+
+    private static bool TryResolveResourcePath(string uri, out string path)
+    {
+        path = "";
+        if (!uri.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+            return false;
+        var raw = uri["file:".Length..].TrimStart('/');
+        if (raw.Length >= 2 && raw[1] == ':')
+            path = raw.Replace('/', Path.DirectorySeparatorChar);
+        else
+            path = "/" + raw.Replace('/', Path.DirectorySeparatorChar);
+        try { path = Path.GetFullPath(path); }
+        catch { return false; }
+        var root = SessionWorkDir.Value;
+        if (string.IsNullOrEmpty(root))
+            return false;
+        var fullRoot = Path.GetFullPath(root);
+        return path.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase);
+    }
 
     private static string HandleToolsCall(JsonElement? id, JsonElement root)
     {
@@ -227,14 +313,7 @@ public static class McpServer
                 w.WriteStartObject("result");
                 w.WriteStartArray("content");
                 foreach (var c in contents)
-                {
-                    w.WriteStartObject();
-                    w.WriteString("type", c.Type);
-                    if (c.Text != null) w.WriteString("text", c.Text);
-                    if (c.Data != null) w.WriteString("data", c.Data);
-                    if (c.MimeType != null) w.WriteString("mimeType", c.MimeType);
-                    w.WriteEndObject();
-                }
+                    WriteContent(w, c);
                 w.WriteEndArray();
                 w.WriteBoolean("isError", isError);
                 w.WriteEndObject();
@@ -268,10 +347,39 @@ public static class McpServer
 
     /// <summary>
     /// MCP content block. Most tool responses are a single text block; screenshot
-    /// returns a text caption + an image block (base64 PNG). Fields not relevant
-    /// to a given Type are left null and omitted on serialization.
+    /// returns a text caption + an image block (base64 PNG). create/save/close/merge
+    /// attach the Office file as an embedded resource (type=resource, blob).
+    /// Fields not relevant to a given Type are left null and omitted on serialization.
     /// </summary>
-    private sealed record McpContent(string Type, string? Text = null, string? Data = null, string? MimeType = null);
+    private sealed record McpContent(string Type, string? Text = null, string? Data = null, string? MimeType = null, string? Uri = null);
+
+    private static void WriteContent(Utf8JsonWriter w, McpContent c)
+    {
+        w.WriteStartObject();
+        w.WriteString("type", c.Type);
+        if (c.Type == "resource")
+        {
+            w.WriteStartObject("resource");
+            w.WriteString("uri", c.Uri ?? "");
+            if (c.MimeType != null) w.WriteString("mimeType", c.MimeType);
+            if (c.Data != null) w.WriteString("blob", c.Data);
+            w.WriteStartObject("annotations");
+            w.WriteStartArray("audience");
+            w.WriteStringValue("user");
+            w.WriteStringValue("assistant");
+            w.WriteEndArray();
+            w.WriteString("lastModified", DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"));
+            w.WriteEndObject();
+            w.WriteEndObject();
+        }
+        else
+        {
+            if (c.Text != null) w.WriteString("text", c.Text);
+            if (c.Data != null) w.WriteString("data", c.Data);
+            if (c.MimeType != null) w.WriteString("mimeType", c.MimeType);
+        }
+        w.WriteEndObject();
+    }
 
     // ==================== Thin command-line exec ====================
     // The MCP tool is a thin shell over the CLI: the caller passes the officecli
@@ -293,7 +401,8 @@ public static class McpServer
             return (new[] { new McpContent("text", Text: HandleSkillCommand(argv)) }, false);
         if (IsScreenshot(argv))
             return (RunScreenshotArgv(argv), false);
-        return SurfaceCliResult(RunCliRaw(argv));
+        var surfaced = SurfaceCliResult(RunCliRaw(argv));
+        return (MaybeAttachDocument(argv, surfaced.Contents, surfaced.IsError), surfaced.IsError);
     }
 
     private static string[] ExtractArgv(JsonElement args)
@@ -446,7 +555,31 @@ public static class McpServer
     /// stripped one-liner. Surfacing only `pr.Errors` here used to drop that
     /// usage block, making MCP less informative than the bare CLI.
     /// </summary>
+    private static readonly AsyncLocal<string?> SessionWorkDir = new();
+    private static readonly SemaphoreSlim CliGate = new(1, 1);
+    private const long MaxAttachBytes = 32L * 1024 * 1024;
+    private static readonly HashSet<string> AttachVerbs = new(StringComparer.OrdinalIgnoreCase)
+        { "create", "save", "close", "merge" };
+    private static readonly HashSet<string> OfficeExts = new(StringComparer.OrdinalIgnoreCase)
+        { ".docx", ".pptx", ".xlsx", ".docm", ".pptm", ".xlsm" };
+
     private static CliResult RunCliRaw(string[] argv)
+    {
+        var workDir = SessionWorkDir.Value;
+        if (string.IsNullOrEmpty(workDir))
+            return InvokeCli(argv);
+        CliGate.Wait();
+        try
+        {
+            var prev = Environment.CurrentDirectory;
+            Directory.SetCurrentDirectory(workDir);
+            try { return InvokeCli(argv); }
+            finally { Directory.SetCurrentDirectory(prev); }
+        }
+        finally { CliGate.Release(); }
+    }
+
+    private static CliResult InvokeCli(string[] argv)
     {
         var pr = RootCommand.Parse(argv);
         var prevOut = Console.Out;
@@ -457,6 +590,56 @@ public static class McpServer
         try { Console.SetOut(so); Console.SetError(se); exit = pr.Invoke(); }
         finally { Console.SetOut(prevOut); Console.SetError(prevErr); }
         return new CliResult(exit, so.ToString(), se.ToString());
+    }
+
+    private static IReadOnlyList<McpContent> MaybeAttachDocument(string[] argv, IReadOnlyList<McpContent> contents, bool isError)
+    {
+        if (isError || argv.Length == 0 || !AttachVerbs.Contains(argv[0]))
+            return contents;
+        var path = ResolveAttachPath(argv);
+        if (path == null || !File.Exists(path))
+            return contents;
+        var info = new FileInfo(path);
+        if (info.Length > MaxAttachBytes)
+        {
+            var note = new McpContent("text", Text: $"Document not attached (size {info.Length} exceeds {MaxAttachBytes} byte limit): {path}");
+            return contents.Append(note).ToArray();
+        }
+        var ext = Path.GetExtension(path);
+        var mime = MimeFromOfficeExt(ext);
+        var uri = ToFileUri(path);
+        var blob = Convert.ToBase64String(File.ReadAllBytes(path));
+        var resource = new McpContent("resource", Data: blob, MimeType: mime, Uri: uri);
+        return contents.Append(resource).ToArray();
+    }
+
+    private static string? ResolveAttachPath(string[] argv)
+    {
+        var files = argv.Skip(1).Where(a => OfficeExts.Contains(Path.GetExtension(a))).ToList();
+        if (files.Count == 0) return null;
+        var rel = argv[0].Equals("merge", StringComparison.OrdinalIgnoreCase) && files.Count >= 2
+            ? files[1]
+            : files[0];
+        if (Path.IsPathRooted(rel))
+            return Path.GetFullPath(rel);
+        var root = SessionWorkDir.Value ?? Environment.CurrentDirectory;
+        return Path.GetFullPath(Path.Combine(root, rel));
+    }
+
+    private static string MimeFromOfficeExt(string ext) => ext.ToLowerInvariant() switch
+    {
+        ".docx" or ".docm" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".pptx" or ".pptm" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".xlsx" or ".xlsm" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    };
+
+    private static string ToFileUri(string path)
+    {
+        var full = Path.GetFullPath(path).Replace('\\', '/');
+        if (full.Length >= 2 && full[1] == ':')
+            return "file:///" + full;
+        return "file://" + (full.StartsWith('/') ? full : "/" + full);
     }
 
     // Translate a CLI invocation's (exit, stdout, stderr) into MCP content.
@@ -530,17 +713,24 @@ Delivery gate (before reporting a document finished — any failure = fix and re
 1. Schema: `validate <file>` -> clean, no errors.
 2. Content: `view <file> issues` -> no overflow/format/structure issues; and scan `view <file> text` for leftover placeholders (xxxx, lorem/ipsum, <TODO>, {{...}}, $VAR$, empty ()/[]).
 3. Visual audit: `view <file> screenshot --page N` renders the page/slide and returns it as an image shown to you (or --grid auto for a whole-doc contact sheet). Judge it adversarially (assume problems exist) for overlap, text overflow, off-slide shapes, dark-on-dark, misalignment; fix positions/sizes (`set <file> <path> --prop x=.. --prop y=..`) and re-screenshot until right; if the screenshot can't render, say 'not visually verified'. Whether this audit is mandatory is format-specific (slide decks need it most — absolute-positioned shapes overlap invisibly to text modes), so run `load_skill pptx` (or word / excel) for the authoritative gate. The per-format SKILL.md, not this blurb, is the source of truth for what 'done' requires.
-4. Flush to disk: end with `save <file>` — this guarantees your edits are written to disk before you hand the file off. Required final step, not optional (always safe — never errors or loses work; `close` also flushes if you want to end the session too).";
+4. Flush to disk: end with `save <file>` — this guarantees your edits are written to disk before you hand the file off. Required final step, not optional (always safe — never errors or loses work; `close` also flushes if you want to end the session too). `create`, `save`, `close`, and `merge` return the Office file as an embedded MCP resource (base64 blob) so the host can deliver it to the user.";
 
     private static void WriteToolDefinitions(Utf8JsonWriter w)
     {
         w.WriteStartObject();
         w.WriteString("name", "officecli");
+        w.WriteString("title", "OfficeCLI");
         // Append a compact always-on skill-trigger summary so the agent is
         // prompted to load the right skill without the full ~1.2k of routing
         // descriptions resident in context. Detail stays lazy behind load_skill.
         w.WriteString("description", ToolDescription + "\n\n" + McpHelpStrategy + "\n"
             + OfficeCli.Core.SkillInstaller.BuildSkillTriggerSummary());
+        w.WriteStartObject("annotations");
+        w.WriteBoolean("readOnlyHint", false);
+        w.WriteBoolean("destructiveHint", true);
+        w.WriteBoolean("idempotentHint", false);
+        w.WriteBoolean("openWorldHint", false);
+        w.WriteEndObject();
         w.WriteStartObject("inputSchema");
         w.WriteString("type", "object");
         w.WriteStartObject("properties");

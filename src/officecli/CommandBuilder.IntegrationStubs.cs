@@ -25,7 +25,7 @@ static partial class CommandBuilder
     private static readonly Dictionary<string, string> StubBlurbs =
         new(StringComparer.OrdinalIgnoreCase)
         {
-            ["mcp"]     = "Start the MCP stdio server, or register/unregister officecli with an MCP client. Run 'officecli help mcp' for full usage.",
+            ["mcp"]     = "Start the MCP stdio or Streamable HTTP server, or register/unregister officecli with an MCP client. Run 'officecli help mcp' for full usage.",
             ["skills"]  = "Install agent skill definitions (Claude Code, Cursor, Copilot, ...). Run 'officecli help skills' for full usage.",
             ["install"] = "One-step setup: install binary + skills + MCP for detected agents. Run 'officecli help install' for full usage.",
         };

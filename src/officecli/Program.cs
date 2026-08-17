@@ -126,28 +126,37 @@ if (args.Length > 0)
     }
 }
 
-// MCP commands: officecli mcp [target]
+// MCP commands: officecli mcp [target] | officecli mcp --http
 if (args.Length >= 1 && args[0] == "mcp")
 {
-    if (args.Length == 1)
+    var rest = args.Skip(1).ToArray();
+    if (rest.Length == 0)
     {
-        // officecli mcp → start MCP server
         await OfficeCli.McpServer.RunAsync();
         return 0;
     }
-    if (args.Length == 2 && args[1] == "list")
+    if (OfficeCli.McpServer.LooksLikeHttp(rest))
+    {
+        if (!OfficeCli.McpServer.TryParseHttpOptions(rest, out var httpOpts, out var httpErr))
+        {
+            Console.Error.WriteLine(httpErr);
+            return 1;
+        }
+        await OfficeCli.McpServer.RunHttpAsync(httpOpts);
+        return 0;
+    }
+    if (rest.Length == 1 && rest[0] == "list")
     {
         OfficeCli.McpInstaller.Install("list");
         return 0;
     }
-    if (args.Length == 3 && args[1] == "uninstall")
+    if (rest.Length == 2 && rest[0] == "uninstall")
     {
-        return OfficeCli.McpInstaller.Uninstall(args[2]) ? 0 : 1;
+        return OfficeCli.McpInstaller.Uninstall(rest[1]) ? 0 : 1;
     }
-    if (args.Length == 2)
+    if (rest.Length == 1)
     {
-        // officecli mcp <target> → register + show instructions
-        return OfficeCli.McpInstaller.Install(args[1]) ? 0 : 1;
+        return OfficeCli.McpInstaller.Install(rest[0]) ? 0 : 1;
     }
     OfficeCli.CommandBuilder.WriteEarlyDispatchUsage("mcp", Console.Error);
     return 1;

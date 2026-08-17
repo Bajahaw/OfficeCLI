@@ -48,11 +48,15 @@ static partial class CommandBuilder
             {
                 "Usage:",
                 "  officecli mcp                    Start MCP stdio server (for AI agents)",
+                "  officecli mcp --http             Start Streamable HTTP MCP server (protocol 2025-11-25)",
+                "  officecli mcp --http --port 8765 [--host 127.0.0.1] [--token SECRET] [--workdir DIR]",
                 "  officecli mcp <target>           Register officecli with an MCP client",
                 "  officecli mcp uninstall <target> Unregister officecli from an MCP client",
                 "  officecli mcp list               Show registration status across all clients",
                 "",
                 "Targets: lms (LM Studio), claude (Claude Code), cursor, vscode (Copilot)",
+                "HTTP: create/save/close/merge return the Office file as an embedded MCP resource.",
+                "Non-loopback --host requires --token or OFFICECLI_MCP_TOKEN.",
             },
             ["skills"] = new[]
             {
