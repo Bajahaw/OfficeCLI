@@ -139,7 +139,7 @@ if (args.Length >= 1 && args[0] == "mcp")
     {
         if (!OfficeCli.McpServer.TryParseHttpOptions(rest, out var httpOpts, out var httpErr))
         {
-            Console.Error.WriteLine(httpErr);
+            Console.WriteLine(httpErr);
             return 1;
         }
         await OfficeCli.McpServer.RunHttpAsync(httpOpts);

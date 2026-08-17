@@ -74,15 +74,15 @@ public static partial class McpServer
         }
         catch (HttpListenerException ex) when (ex.ErrorCode is 5 or 32)
         {
-            Console.Error.WriteLine($"Failed to bind {prefix}: {ex.Message}");
-            Console.Error.WriteLine("On Windows, non-localhost prefixes need URL ACL reservation or elevation.");
+            Console.WriteLine($"Failed to bind {prefix}: {ex.Message}");
+            Console.WriteLine("On Windows, non-localhost prefixes need URL ACL reservation or elevation.");
             throw;
         }
 
         using var upgradeCts = new CancellationTokenSource();
         var upgradeTask = RunPeriodicUpgradeCheckAsync(upgradeCts.Token);
         var sessions = new ConcurrentDictionary<string, HttpSession>(StringComparer.Ordinal);
-        Console.Error.WriteLine($"officecli MCP HTTP listening on {PublicUrl(options)}");
+        Console.WriteLine($"officecli MCP HTTP listening on {PublicUrl(options)}");
 
         try
         {
