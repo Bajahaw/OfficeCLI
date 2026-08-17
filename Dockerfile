@@ -13,7 +13,6 @@ COPY --from=build /out/officecli /app/officecli
 RUN chmod +x /app/officecli
 
 ENV OFFICECLI_SKIP_UPDATE=1
-ENV OFFICECLI_MCP_TOKEN=
 
 EXPOSE 8765
 VOLUME /data

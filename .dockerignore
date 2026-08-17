@@ -9,7 +9,13 @@ examples
 npm
 sdk
 plugins
-*.md
+/README.md
+/README_*.md
+/CONTRIBUTING.md
+/CONTRIBUTING.zh.md
+/SECURITY.md
+/NOTICE
+/THIRD-PARTY-NOTICES.txt
 *.slnx
 build
 build.sh
